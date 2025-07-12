@@ -5,3 +5,8 @@ networkx
 geopy
 shapely
 pydantic
+pandas
+geopandas
+scipy
+numpy
+lxml
