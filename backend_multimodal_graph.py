@@ -1,12 +1,14 @@
 import os
-# import osmnx as ox  # Removed OSMnx
-# ox.settings.use_cache = False  # Disable cache for a clean start
 import networkx as nx
 from shapely.geometry import Point
 from geopy.distance import geodesic
 import logging
-from pyrosm import OSM  # Added Pyrosm import
-# from pyrosm.network import to_networkx # This line is removed as per the edit hint
+from pyrosm import OSM
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import LineString, MultiLineString
+from scipy.spatial import cKDTree
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +37,6 @@ class MultimodalGraphBuilder:
         self.graphml_path = graphml_path
         self.osm_file = osm_file
         self.network_type = network_type
-        
-        # Configure OSMnx settings
-        
 
     def build(self):
         """
@@ -45,93 +44,199 @@ class MultimodalGraphBuilder:
         Returns:
             nx.MultiDiGraph: The complete multimodal graph
         """
-        # 1. Load from GraphML if available (optional, but OSMnx-specific logic removed)
+        # 1. Load from GraphML if available
         if self.graphml_path and os.path.exists(self.graphml_path):
             logger.info(f"Loading graph from {self.graphml_path} ...")
             self.graph = nx.read_graphml(self.graphml_path)
             logger.info(f"Graph loaded from {self.graphml_path}: {len(self.graph.nodes)} nodes, {len(self.graph.edges)} edges")
             return self.graph
+        
         # 2. Load from OSM PBF file using Pyrosm
         if self.osm_file and os.path.exists(self.osm_file):
             logger.info(f"Loading graph from OSM PBF file: {self.osm_file} ...")
+            
             # Extract networks for each mode
             walk_graph = self._extract_graph('walking')
             bike_graph = self._extract_graph('cycling')
             car_graph = self._extract_graph('driving')
-
+        
             # Relabel nodes to make them unique per mode
-            walk_graph = self._relabel_nodes(walk_graph, 'walk')
-            bike_graph = self._relabel_nodes(bike_graph, 'bike')
-            car_graph = self._relabel_nodes(car_graph, 'car')
-
+        walk_graph = self._relabel_nodes(walk_graph, 'walk')
+        bike_graph = self._relabel_nodes(bike_graph, 'bike')
+        car_graph = self._relabel_nodes(car_graph, 'car')
+        
             # Add mode attributes and calculate travel times
-            self._add_mode_attributes(walk_graph, 'walk', self.walk_speed)
-            self._add_mode_attributes(bike_graph, 'bike', self.bike_speed)
-            self._add_mode_attributes(car_graph, 'car', self.car_speed)
-
+        self._add_mode_attributes(walk_graph, 'walk', self.walk_speed)
+        self._add_mode_attributes(bike_graph, 'bike', self.bike_speed)
+        self._add_mode_attributes(car_graph, 'car', self.car_speed)
+        
             # Merge all graphs
-            logger.info("Merging individual mode graphs...")
-            merged_graph = nx.compose_all([walk_graph, bike_graph, car_graph])
-
+        logger.info("Merging individual mode graphs...")
+        merged_graph = nx.compose_all([walk_graph, bike_graph, car_graph])
+        
             # Add interlayer transfer edges
-            self._add_interlayer_edges(merged_graph, walk_graph, bike_graph, car_graph)
+        self._add_interlayer_edges(merged_graph, walk_graph, bike_graph, car_graph)
+        
+        self.graph = merged_graph
+        logger.info(f"Multimodal graph built successfully: {len(merged_graph.nodes)} nodes, {len(merged_graph.edges)} edges")
 
-            self.graph = merged_graph
-            logger.info(f"Multimodal graph built successfully: {len(merged_graph.nodes)} nodes, {len(merged_graph.edges)} edges")
-
-            # Save the graph if a path is provided (as GraphML, using NetworkX)
-            if self.graphml_path:
-                logger.info(f"Saving graph to {self.graphml_path} ...")
-                nx.write_graphml(self.graph, self.graphml_path)
-                logger.info(f"Graph saved to {self.graphml_path}")
-
-            return merged_graph
-        else:
-            raise ValueError("No valid OSM PBF file provided.")
-
+        # Save the graph if a path is provided
+        if self.graphml_path:
+            logger.info(f"Saving graph to {self.graphml_path} ...")
+            nx.write_graphml(self.graph, self.graphml_path)
+            logger.info(f"Graph saved to {self.graphml_path}")
+        
+        return merged_graph
+    
     def _extract_graph(self, network_type):
+        """
+        Extract graph for a specific network type using Pyrosm
+        """
         logger.info(f"Extracting {network_type} graph using Pyrosm...")
         try:
             osm = OSM(self.osm_file)
             gdf = osm.get_network(network_type=network_type)
-            print("GDF columns:", gdf.columns)
-            # Try using 'u' and 'v' as source and target
-            graph = nx.from_pandas_edgelist(
-                gdf,
-                source="u",
-                target="v",
-                edge_attr=True,
-                create_using=nx.MultiDiGraph()
-            )
+            
+            if gdf.empty:
+                logger.warning(f"No {network_type} network found in OSM data")
+                return nx.MultiDiGraph()
+            
+            print(f"GDF columns for {network_type}:", gdf.columns.tolist())
+            print(f"GDF shape: {gdf.shape}")
+            
+            # Create nodes and edges from the geometry
+            graph = self._create_graph_from_gdf(gdf)
+                
             logger.info(f"{network_type} graph extracted: {len(graph.nodes)} nodes, {len(graph.edges)} edges")
             return graph
+            
         except Exception as e:
             logger.error(f"Failed to extract {network_type} graph: {str(e)}")
-            raise e
+            # Return empty graph instead of raising error
+            return nx.MultiDiGraph()
+
+    def _create_graph_from_gdf(self, gdf):
+        """
+        Create NetworkX graph from GeoDataFrame by extracting nodes from geometry
+        """
+        graph = nx.MultiDiGraph()
+        
+        # Dictionary to store unique nodes
+        nodes_dict = {}
+        node_id = 0
+        
+        def get_or_create_node(lat, lon):
+            """Get existing node or create new one"""
+            nonlocal node_id
+            # Round coordinates to avoid floating point issues
+            lat_rounded = round(lat, 6)
+            lon_rounded = round(lon, 6)
+            coord_key = (lat_rounded, lon_rounded)
+            
+            if coord_key not in nodes_dict:
+                nodes_dict[coord_key] = node_id
+                graph.add_node(node_id, x=lon_rounded, y=lat_rounded)
+                node_id += 1
+            
+            return nodes_dict[coord_key]
+        
+        # Process each edge in the GeoDataFrame
+        for idx, row in gdf.iterrows():
+            try:
+                geom = row.geometry
+                if geom is None:
+                    continue
+                
+                # Extract coordinates from geometry
+                coords = []
+                if isinstance(geom, LineString):
+                    coords = list(geom.coords)
+                elif isinstance(geom, MultiLineString):
+                    # Flatten all parts into one list of coordinates
+                    for part in geom.geoms:
+                        coords.extend(list(part.coords))
+                else:
+                    continue
+                
+                if len(coords) < 2:
+                    continue
+                
+                # Get start and end points
+                start_lon, start_lat = coords[0]
+                end_lon, end_lat = coords[-1]
+                
+                # Create or get nodes
+                start_node = get_or_create_node(start_lat, start_lon)
+                end_node = get_or_create_node(end_lat, end_lon)
+                
+                # Skip self-loops
+                if start_node == end_node:
+                    continue
+                
+                # Add edge with attributes
+                edge_attrs = {
+                    'length': row.get('length', self._calculate_length(coords)),
+                    'highway': row.get('highway', 'unclassified'),
+                    'name': row.get('name', ''),
+                    'maxspeed': row.get('maxspeed', None),
+                    'oneway': row.get('oneway', False),
+                    'geometry': geom
+                }
+                
+                # Add any other relevant attributes
+                for col in ['surface', 'lanes', 'bicycle', 'foot', 'motor_vehicle']:
+                    if col in row and pd.notna(row[col]):
+                        edge_attrs[col] = row[col]
+                
+                graph.add_edge(start_node, end_node, **edge_attrs)
+                
+                # Add reverse edge if not oneway
+                if not self._is_oneway(row):
+                    graph.add_edge(end_node, start_node, **edge_attrs)
+                
+            except Exception as e:
+                logger.warning(f"Error processing edge {idx}: {str(e)}")
+                continue
+        
+        return graph
+
+    def _calculate_length(self, coords):
+        """Calculate length of a line from coordinates"""
+        if len(coords) < 2:
+            return 0
+        
+        total_length = 0
+        for i in range(len(coords) - 1):
+            lon1, lat1 = coords[i]
+            lon2, lat2 = coords[i + 1]
+            total_length += geodesic((lat1, lon1), (lat2, lon2)).meters
+        
+        return total_length
+
+    def _is_oneway(self, row):
+        """Check if the way is oneway"""
+        oneway = row.get('oneway', False)
+        if isinstance(oneway, str):
+            return oneway.lower() in ['yes', 'true', '1']
+        return bool(oneway)
     
     def _relabel_nodes(self, graph, mode_suffix):
         """
         Relabel nodes to include mode suffix
-        
-        Args:
-            graph: The graph to relabel
-            mode_suffix: Suffix to add to node names
-            
-        Returns:
-            nx.MultiDiGraph: Graph with relabeled nodes
         """
+        if graph.number_of_nodes() == 0:
+            return graph
+        
         logger.info(f"Relabeling nodes for {mode_suffix} mode...")
         return nx.relabel_nodes(graph, lambda n: f"{n}_{mode_suffix}")
     
     def _add_mode_attributes(self, graph, mode, speed_kmh):
         """
         Add mode and time attributes to edges
-        
-        Args:
-            graph: The graph to modify
-            mode: The transportation mode
-            speed_kmh: Speed in km/h
         """
+        if graph.number_of_edges() == 0:
+            return
+        
         logger.info(f"Adding attributes for {mode} mode...")
         
         for u, v, key, data in graph.edges(data=True, keys=True):
@@ -139,7 +244,7 @@ class MultimodalGraphBuilder:
             data['mode'] = mode
             
             # Calculate travel time in minutes
-            if 'length' in data:
+            if 'length' in data and data['length'] > 0:
                 # Convert length from meters to km, then calculate time
                 distance_km = data['length'] / 1000
                 time_hours = distance_km / speed_kmh
@@ -153,80 +258,48 @@ class MultimodalGraphBuilder:
             data['weight'] = data['time']
     
     def _add_interlayer_edges(self, merged_graph, walk_graph, bike_graph, car_graph):
-        """
-        Add transfer edges between different transportation modes
-        
-        Args:
-            merged_graph: The merged graph to add edges to
-            walk_graph: Walking graph
-            bike_graph: Biking graph
-            car_graph: Car graph
-        """
         logger.info("Adding interlayer transfer edges...")
-        
-        # Build lookup for node positions
+
+        # Collect all nodes and their positions
         node_positions = {}
-        
         for mode_graph, suffix in [(walk_graph, '_walk'), (bike_graph, '_bike'), (car_graph, '_car')]:
             for node_id, node_data in mode_graph.nodes(data=True):
                 if 'y' in node_data and 'x' in node_data:
                     node_positions[node_id] = (node_data['y'], node_data['x'])
-        
-        # Add transfer edges between nodes within 10 meters
-        transfer_edges_added = 0
+
+        # Build arrays for KDTree
+        node_ids = list(node_positions.keys())
+        coords = np.array([node_positions[nid] for nid in node_ids])
+
+        # Build KDTree for fast neighbor search
+        tree = cKDTree(coords)
         max_transfer_distance = 10  # meters
-        
-        for node1, pos1 in node_positions.items():
-            for node2, pos2 in node_positions.items():
+
+        transfer_edges_added = 0
+        for idx, node1 in enumerate(node_ids):
+            pos1 = coords[idx]
+            # Find all nodes within max_transfer_distance (including itself)
+            indices = tree.query_ball_point(pos1, max_transfer_distance / 111_139)  # ~meters to degrees
+            for j in indices:
+                node2 = node_ids[j]
                 if node1 == node2:
                     continue
-                
-                # Skip if same original OSM node (different modes)
-                original_id1 = node1.split('_')[0]
-                original_id2 = node2.split('_')[0]
-                
-                if original_id1 == original_id2:
-                    # Same original node, add transfer edge with minimal cost
+                # Only add transfer edges between different modes
+                if node1.split('_')[-1] != node2.split('_')[-1]:
                     merged_graph.add_edge(
-                        node1, node2, 
-                        weight=0.5, 
-                        time=0.5, 
+                        node1, node2,
+                        weight=2.0,
+                        time=2.0,
                         mode='transfer',
                         length=0
                     )
                     transfer_edges_added += 1
-                    continue
-                
-                # Check if nodes are within transfer distance
-                distance = geodesic(pos1, pos2).meters
-                if distance <= max_transfer_distance:
-                    # Add bidirectional transfer edges
-                    transfer_time = 2.0  # 2 minutes transfer time
-                    
-                    merged_graph.add_edge(
-                        node1, node2,
-                        weight=transfer_time,
-                        time=transfer_time,
-                        mode='transfer',
-                        length=distance
-                    )
-                    merged_graph.add_edge(
-                        node2, node1,
-                        weight=transfer_time,
-                        time=transfer_time,
-                        mode='transfer',
-                        length=distance
-                    )
-                    transfer_edges_added += 2
-        
+
         logger.info(f"Added {transfer_edges_added} transfer edges")
     
     def get_graph_stats(self):
         """
         Get statistics about the built graph
-        
-        Returns:
-            dict: Graph statistics
         """
         if self.graph is None:
             return {"error": "Graph not built yet"}
