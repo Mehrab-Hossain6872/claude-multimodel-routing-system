@@ -99,6 +99,7 @@ def _path_to_segments(graph, path):
         # Check if we need to start a new segment
         if current_mode is None:
             current_mode = mode
+            current_coords = [coord]
         
         if mode != current_mode:
             # Save current segment and start new one
@@ -117,7 +118,8 @@ def _path_to_segments(graph, path):
             current_cost = 0
         
         # Add to current segment
-        current_coords.append(coord)
+        if coord not in current_coords:
+            current_coords.append(coord)
         current_time += time
         current_cost += calc_cost(mode, time)
     
@@ -125,10 +127,25 @@ def _path_to_segments(graph, path):
     if len(path) > 1:
         final_node = path[-1]
         final_node_data = graph.nodes[final_node]
-        final_coord = [final_node]
+        final_coord = [final_node_data['y'], final_node_data['x']]
+        if final_coord not in current_coords:
+            current_coords.append(final_coord)
+    
+    # Add final segment
+    if current_mode is not None and current_coords:
+        segments.append({
+            'mode': current_mode,
+            'coords': current_coords,
+            'time': round(current_time, 1),
+            'cost': round(current_cost, 0)
+        })
+    
+    return segments
 
 def _get_edge_data(graph, u, v):
-    # Handles MultiDiGraph edge data extraction
+    """
+    Handles MultiDiGraph edge data extraction
+    """
     edge_data = graph.get_edge_data(u, v)
     if isinstance(edge_data, dict):
         # If MultiDiGraph, get the first edge's data
@@ -137,4 +154,4 @@ def _get_edge_data(graph, u, v):
         else:
             # Get the first available edge data
             return list(edge_data.values())[0]
-    return edge_data
+    return edge_data or {}
