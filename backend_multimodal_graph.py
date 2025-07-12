@@ -61,32 +61,94 @@ class MultimodalGraphBuilder:
             car_graph = self._extract_graph('driving')
         
             # Relabel nodes to make them unique per mode
-        walk_graph = self._relabel_nodes(walk_graph, 'walk')
-        bike_graph = self._relabel_nodes(bike_graph, 'bike')
-        car_graph = self._relabel_nodes(car_graph, 'car')
+            walk_graph = self._relabel_nodes(walk_graph, 'walk')
+            bike_graph = self._relabel_nodes(bike_graph, 'bike')
+            car_graph = self._relabel_nodes(car_graph, 'car')
         
             # Add mode attributes and calculate travel times
-        self._add_mode_attributes(walk_graph, 'walk', self.walk_speed)
-        self._add_mode_attributes(bike_graph, 'bike', self.bike_speed)
-        self._add_mode_attributes(car_graph, 'car', self.car_speed)
+            self._add_mode_attributes(walk_graph, 'walk', self.walk_speed)
+            self._add_mode_attributes(bike_graph, 'bike', self.bike_speed)
+            self._add_mode_attributes(car_graph, 'car', self.car_speed)
         
             # Merge all graphs
-        logger.info("Merging individual mode graphs...")
-        merged_graph = nx.compose_all([walk_graph, bike_graph, car_graph])
+            logger.info("Merging individual mode graphs...")
+            merged_graph = nx.compose_all([walk_graph, bike_graph, car_graph])
         
             # Add interlayer transfer edges
-        self._add_interlayer_edges(merged_graph, walk_graph, bike_graph, car_graph)
+            self._add_interlayer_edges(merged_graph, walk_graph, bike_graph, car_graph)
         
-        self.graph = merged_graph
-        logger.info(f"Multimodal graph built successfully: {len(merged_graph.nodes)} nodes, {len(merged_graph.edges)} edges")
+            self.graph = merged_graph
+            logger.info(f"Multimodal graph built successfully: {len(merged_graph.nodes)} nodes, {len(merged_graph.edges)} edges")
 
-        # Save the graph if a path is provided
-        if self.graphml_path:
-            logger.info(f"Saving graph to {self.graphml_path} ...")
-            nx.write_graphml(self.graph, self.graphml_path)
-            logger.info(f"Graph saved to {self.graphml_path}")
+            # Save the graph if a path is provided
+            if self.graphml_path:
+                logger.info(f"Saving graph to {self.graphml_path} ...")
+                # Clean the graph before saving
+                cleaned_graph = self._clean_graph_for_graphml(self.graph)
+                nx.write_graphml(cleaned_graph, self.graphml_path)
+                logger.info(f"Graph saved to {self.graphml_path}")
         
-        return merged_graph
+            return merged_graph
+    
+    def _clean_graph_for_graphml(self, graph):
+        """
+        Clean the graph by removing None values and converting problematic data types
+        """
+        logger.info("Cleaning graph data for GraphML export...")
+        
+        # Create a copy to avoid modifying the original
+        cleaned_graph = graph.copy()
+        
+        # Clean node attributes
+        for node_id, data in cleaned_graph.nodes(data=True):
+            cleaned_data = {}
+            for key, value in data.items():
+                if value is None:
+                    # Replace None with appropriate default values
+                    if key in ['x', 'y']:
+                        cleaned_data[key] = 0.0
+                    elif key in ['name']:
+                        cleaned_data[key] = ""
+                    else:
+                        cleaned_data[key] = ""
+                elif isinstance(value, (int, float, str, bool)):
+                    cleaned_data[key] = value
+                else:
+                    # Convert complex objects to strings
+                    cleaned_data[key] = str(value)
+            
+            # Update node data
+            cleaned_graph.nodes[node_id].clear()
+            cleaned_graph.nodes[node_id].update(cleaned_data)
+        
+        # Clean edge attributes
+        for u, v, key, data in cleaned_graph.edges(data=True, keys=True):
+            cleaned_data = {}
+            for attr_key, value in data.items():
+                if value is None:
+                    # Replace None with appropriate default values
+                    if attr_key in ['length', 'time', 'weight']:
+                        cleaned_data[attr_key] = 0.0
+                    elif attr_key in ['mode', 'highway', 'name']:
+                        cleaned_data[attr_key] = ""
+                    elif attr_key in ['oneway']:
+                        cleaned_data[attr_key] = False
+                    else:
+                        cleaned_data[attr_key] = ""
+                elif isinstance(value, (int, float, str, bool)):
+                    cleaned_data[attr_key] = value
+                elif hasattr(value, '__geo_interface__'):
+                    # Handle geometry objects by converting to WKT
+                    cleaned_data[attr_key] = str(value)
+                else:
+                    # Convert other objects to strings
+                    cleaned_data[attr_key] = str(value)
+            
+            # Update edge data
+            cleaned_graph.edges[u, v, key].clear()
+            cleaned_graph.edges[u, v, key].update(cleaned_data)
+        
+        return cleaned_graph
     
     def _extract_graph(self, network_type):
         """
@@ -173,20 +235,20 @@ class MultimodalGraphBuilder:
                 if start_node == end_node:
                     continue
                 
-                # Add edge with attributes
+                # Add edge with attributes, handling None values
                 edge_attrs = {
-                    'length': row.get('length', self._calculate_length(coords)),
-                    'highway': row.get('highway', 'unclassified'),
-                    'name': row.get('name', ''),
-                    'maxspeed': row.get('maxspeed', None),
-                    'oneway': row.get('oneway', False),
-                    'geometry': geom
+                    'length': self._safe_get_value(row, 'length', self._calculate_length(coords)),
+                    'highway': self._safe_get_value(row, 'highway', 'unclassified'),
+                    'name': self._safe_get_value(row, 'name', ''),
+                    'maxspeed': self._safe_get_value(row, 'maxspeed', ''),
+                    'oneway': self._safe_get_value(row, 'oneway', False),
+                    # Don't store geometry in GraphML as it's not supported
                 }
                 
                 # Add any other relevant attributes
                 for col in ['surface', 'lanes', 'bicycle', 'foot', 'motor_vehicle']:
                     if col in row and pd.notna(row[col]):
-                        edge_attrs[col] = row[col]
+                        edge_attrs[col] = self._safe_get_value(row, col, '')
                 
                 graph.add_edge(start_node, end_node, **edge_attrs)
                 
@@ -199,6 +261,17 @@ class MultimodalGraphBuilder:
                 continue
         
         return graph
+
+    def _safe_get_value(self, row, key, default):
+        """
+        Safely get value from row, handling None and NaN values
+        """
+        if key in row:
+            value = row[key]
+            if pd.isna(value) or value is None:
+                return default
+            return value
+        return default
 
     def _calculate_length(self, coords):
         """Calculate length of a line from coordinates"""
@@ -244,9 +317,10 @@ class MultimodalGraphBuilder:
             data['mode'] = mode
             
             # Calculate travel time in minutes
-            if 'length' in data and data['length'] > 0:
+            length = data.get('length', 0)
+            if length > 0:
                 # Convert length from meters to km, then calculate time
-                distance_km = data['length'] / 1000
+                distance_km = length / 1000
                 time_hours = distance_km / speed_kmh
                 time_minutes = time_hours * 60
                 data['time'] = time_minutes
